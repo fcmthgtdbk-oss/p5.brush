@@ -53,15 +53,17 @@ const smooth = (a, b, x) => {
 };
 
 // ── Camera: wing rotates about the body axis, viewed obliquely from above ───
-const SHOULDER = [470, 450];
+const SHOULDER_Y = 450;
+const SHOULDER = [470, SHOULDER_Y];
 const TILT = 0.55; // camera elevation (radians)
 
 function project(p, pose) {
   const [x, y] = p;
   // spanwise flex: distal hand lags behind the stroke
   const flex = pose.flex * Math.pow(Math.max(0, x - 260) / 300, 2) * 60;
-  const X = x * Math.cos(pose.theta);
-  const Z = x * Math.sin(pose.theta) + flex;
+  const span = 1 - (pose.fold ?? 0) * smooth(120, 520, x);
+  const X = x * span * Math.cos(pose.theta);
+  const Z = x * span * Math.sin(pose.theta) + flex;
   const Y = y + pose.sweep * x * x * 0.0004;
   return [
     SHOULDER[0] + X * pose.scale,
@@ -584,35 +586,104 @@ function paperTooth() {
   }
 }
 
-function draw() {
-  brush.clear(PAPER);
-  brush.push();
-  brush.translate(-W / 2, -H / 2);
+// Pose of the wing at a point of the beat cycle (0 = top of the upstroke,
+// 0.5 = bottom of the downstroke). The hand lags behind the arm, so the tip
+// bends up on the way down and trails on the way up, where the wing also
+// folds a little and sweeps back to slip through the air.
+function poseAt(t) {
+  const a = t * Math.PI * 2;
+  const up = Math.max(0, -Math.sin(a));
+  return {
+    theta: 0.165 + 0.785 * Math.cos(a),
+    flex: 0.9 * Math.sin(a),
+    sweep: 0.32 * up - 0.08 * Math.max(0, Math.sin(a)),
+    fold: 0.14 * up,
+    scale: 1,
+  };
+}
 
-  paperTooth();
-  ghostWing(POSES.up, "#8a7a68", 0.9);
-  ghostWing(POSES.down, "#988978", 0.8);
-  motionLines(POSES);
-  body();
+function paintWing(pose) {
   const order = paintOrder();
   const firstCovert = order.findIndex((f) => f.kind === "pgc");
-  order.slice(0, firstCovert).forEach((f) => paintFeather(f, POSES.main));
+  order.slice(0, firstCovert).forEach((f) => paintFeather(f, pose));
   // patagium: the skin fold of the leading edge, washed in before the coverts
   brush.noStroke();
   brush.fill("#5b412e", 150);
   brush.fillBleed(0.08, "out");
   brush.fillTexture(0.5, 0.3, true, 0.2);
-  brush.polygon(P([[-10, -40], [90, -82], [210, -84], [300, -102], [395, -94], [420, -60], [330, 40], [200, 60], [90, 70], [-10, 50]], POSES.main));
-  order.slice(firstCovert).forEach((f) => paintFeather(f, POSES.main));
+  brush.polygon(P([[-10, -40], [90, -82], [210, -84], [300, -102], [395, -94], [420, -60], [330, 40], [200, 60], [90, 70], [-10, 50]], pose));
+  order.slice(firstCovert).forEach((f) => paintFeather(f, pose));
 
-  // wrist highlight & leading-edge shadow
+  // leading-edge shadow
   brush.set("charcoal", "#1e1712", 0.7);
-  const lead = [[-10, -46], [90, -86], [210, -90], [300, -106], [392, -98]].map((p) => [...project(p, POSES.main), 1]);
+  const lead = [[-10, -46], [90, -86], [210, -90], [300, -106], [392, -98]].map((p) => [...project(p, pose), 1]);
   brush.spline(lead, 0.6);
+}
+
+// phase === null → the still study with both ghost phases;
+// otherwise one frame of the beat, with a graphite echo of the moment before.
+function draw(phase = null) {
+  // same seeds every frame, so paper and pigment hold still while the wing moves
+  _s = SEED * 9301 + 49297;
+  brush.seed(SEED);
+  brush.noiseSeed(SEED);
+  SHOULDER[1] = SHOULDER_Y;
+
+  brush.clear(PAPER);
+  brush.push();
+  brush.translate(-W / 2, -H / 2);
+
+  paperTooth();
+  if (phase === null) {
+    ghostWing(POSES.up, "#8a7a68", 0.9);
+    ghostWing(POSES.down, "#988978", 0.8);
+    motionLines(POSES);
+    body();
+    paintWing(POSES.main);
+  } else {
+    // the body answers the stroke: it rises as the wing pushes down
+    SHOULDER[1] = SHOULDER_Y + 9 * Math.cos((phase - 0.12) * Math.PI * 2);
+    ghostWing(poseAt(phase - 0.07), "#a39483", 0.7);
+    body();
+    paintWing(poseAt(phase));
+  }
 
   brush.pop();
   brush.render();
-  window.__done = true;
 }
 
-draw();
+// ── Modes ───────────────────────────────────────────────────────────────────
+//   index.html              the still study
+//   index.html?phase=0.3    a single frame of the beat (used to export frames)
+//   index.html?animate=24   paints 24 frames once, then plays them in a loop
+const params = new URLSearchParams(location.search);
+
+if (params.has("animate")) {
+  const N = clamp(parseInt(params.get("animate")) || 24, 4, 96);
+  const glCanvas = document.querySelector("canvas");
+  const frames = [];
+  const paintNext = async (i) => {
+    draw(i / N);
+    frames.push(await createImageBitmap(glCanvas));
+    document.title = `Взмах крыла — ${i + 1}/${N}`;
+    if (i + 1 < N) return setTimeout(() => paintNext(i + 1), 0);
+    // playback on a plain 2D canvas that takes the place of the WebGL one
+    const view = document.createElement("canvas");
+    view.width = glCanvas.width;
+    view.height = glCanvas.height;
+    glCanvas.replaceWith(view);
+    const ctx = view.getContext("2d");
+    const fps = Number(params.get("fps")) || 16;
+    const t0 = performance.now();
+    const play = (now) => {
+      ctx.drawImage(frames[Math.floor(((now - t0) / 1000) * fps) % N], 0, 0);
+      requestAnimationFrame(play);
+    };
+    document.title = "Взмах крыла";
+    requestAnimationFrame(play);
+  };
+  paintNext(0);
+} else {
+  draw(params.has("phase") ? Number(params.get("phase")) : null);
+  window.__done = true;
+}
